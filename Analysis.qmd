@@ -1,0 +1,509 @@
+---
+title: "Interrupted Time Series Analysis"
+author: "C Westwood"
+date: "28 April 2025"
+format: html
+editor: visual
+---
+
+## Introduction
+
+Before beginning the process of writing up the results and deciding what to focus on in the discussion, I thought it would be helpful to present a rough initial analysis and some visualisations to give some direction. While the stats themselves are basically finished (I think), the visuals still need work but that will be primarily aesthetic.
+
+This analysis will focus on the timing of ultrasounds before and after the intervention at the end of November 2018. This analysis will be an ARIMA-model for the continuous data, and a Generalised Estimating Equation for the proportion of early scans. There is also some secondary analysis of time between booking and ultrasounds. I could also add an analysis of timing of booking if that would be deemed to be helpful/necessary.
+
+The initial process (not included here) was data cleaning (in excel), creating the time series in R, and doing some preliminary analysis on the Pre-Intervention data to choose the correct model. This process showed a non-stationary mean, and a (0, 1, 1) ARIMA model as optimal. I have excluded this from this document for ease of use but can add it if necessary.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+## Libraries
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(nlme)
+library(geepack)
+library(lmtest)
+library(modelsummary)
+library(gtsummary)
+library(geepack)
+library(segmented)
+library(gt)
+library(tinytex)
+
+## Import dataset (set working directory, set null values to <NA>, import dataset)
+path <- file.path("C:", "Users", "westw", "OneDrive", "Documents", "WSU Family Medicine", "MMed", "Data", sep = "//")
+setwd(path)
+na_strings <- c("1900/01/00", "", "NA", "na", "No Ultrasound", "Unknown")
+data <- read.csv("r_formatted_data.csv", header = TRUE, sep = ",", na.strings = na_strings)
+
+## Set start/end/intervention date
+intervention_date <- as.Date("2018-11-30")
+lag_date <- as.Date("2019-03-31")
+start_date <- as.Date("2017-01-01")
+end_date <- as.Date("2020-07-31")
+
+## Assign date columns to date format
+date_columns <- grep("date|edd", names(data), value = "TRUE")
+data[date_columns] <- lapply(data[date_columns], as.Date, format = "%d %m %Y")
+
+## Remove data that falls outside of study dates (1 Jan 2017 -> 31 July 2020)
+data <- data %>% filter(date_delivery >= start_date & date_delivery <= end_date)
+
+## Add columns indicating if delivery + ultrasound pre/post intervention
+data <- data %>%
+  mutate(delivery_prepost = ifelse(date_delivery > intervention_date, 1, 0),
+         lag_prepost = ifelse(date_delivery > lag_date, 1, 0)
+  )
+
+## Add columns for primigravidas, dummy variables for HIV/high-risk
+data <- data %>%
+  mutate(primigravid = ifelse(parity == 0, 1, 0), 
+         hivpos = case_when(hiv == "negative" ~ 0,
+                            hiv == "positive" ~ 1),
+         high_riskstate = case_when(high_risk == "no" ~ 0,
+                                    high_risk == "yes" ~ 1))
+
+# Add columns for delivery/ultrasound months
+data$delivery_month <- floor_date(data$date_delivery, "month")
+data$ultrasound_month <-  floor_date(data$date_us, "month") 
+
+# Add counter for months since start, and post intervention
+data <- data %>% 
+  mutate(month_index = interval(min(delivery_month), delivery_month) %/% months(1), # Months from start
+         intervention_month = min(delivery_month[which(delivery_prepost == 1)]),  
+         months_since_intervention = pmax(0, interval(intervention_month, delivery_month) %/% months(1)),
+         months_since_lag = pmax(0, interval(lag_date, delivery_month) %/% months(1))
+  )
+
+# Aggregate by month
+agg <- data %>%
+  group_by(month_index) %>%
+  summarise(
+    n = n(),
+    us_gest = mean(us_days, na.rm = TRUE),
+    us_earlyrate = sum(us_early == "Early", na.rm = TRUE) / n, 
+    us_any = (n - sum(is.na(us_early))) / n,
+    age = mean(age, na.rm = TRUE),
+    hiv = mean(hivpos, na.rm = TRUE),
+    high_risk = mean(high_riskstate, na.rm = TRUE),
+    parity = mean(parity, na.rm = TRUE),
+    primi = mean(primigravid, na.rm = TRUE),
+    book_earlyrate = sum(book_early == "Early", na.rm = TRUE) / n,
+    anc_visits = mean(antenatal, na.rm = TRUE),
+    anc_4ormore = sum(antenatal > 3) / n,
+    pre_post = max(delivery_prepost),
+    lag = min(lag_prepost),
+    months_post = max(months_since_intervention),
+    lag_post = max(months_since_lag),
+    book_us = mean(book_to_us, na.rm = TRUE)
+  )
+agg$date <- seq.Date(from = as.Date("2017-01-01"),
+                                by = "month", 
+                                length.out = nrow(agg))
+# Create Time Series
+ts <- ts(agg$us_gest, start = c(2017,1), frequency = 12)
+pre_ts <- ts[1:23]
+post_ts <- ts[24:42]
+
+## Check ACF/pACF (Performed initially, but now commented for efficiency)
+ggtsdisplay(pre_ts, main="ACF/PACF of Raw Data")
+#adf.test(pre_ts)
+#kpss.test(pre_ts)
+## Initial testing shows non-stationarity of the mean on the pre-intervention data, thus differencing is needed
+## as part of the ARIMA model. Non-stationarity also makes ARIMA the preferred method over GLS/OLS
+
+## Different model compositions - matrix 2 includes control variable. Xreg_cf is utilised for counterfactual prediction (when no intervention occurs).
+xreg_matrix <- cbind(time = agg$month_index, 
+                    intervention = agg$pre_post,
+                    time_since_int = agg$months_post)
+xreg_matrix2 <- cbind(time = agg$month_index,
+                      intervention = agg$pre_post,
+                      time_since_int = agg$months_post,
+                      age = agg$age,
+                      primi  = agg$primi,
+                      hiv = agg$hiv,
+                      highrisk = agg$high_risk)
+xreg_cf <- xreg_matrix2
+xreg_cf[, "intervention"] <- 0
+xreg_cf[,"time_since_int"] <- 0
+
+# p,d,q of (0,1,1) chosen based on Ljung-box, residuals, AIC/BIC/LogLik (performed on pre-intervention data)
+arima_model <- Arima(pre_ts, order = c(0, 1, 1), seasonal = c(0,0,0))
+
+checkresiduals(arima_model)
+
+# Run model on whole dataset with external regressors
+arima_basic <- Arima(ts, order = c(0, 1, 1), seasonal = c(0,0,0), xreg = xreg_matrix, method = "ML", include.mean = TRUE)
+coeftest(arima_basic)
+summary(arima_basic)
+
+arima_controlled <- Arima(ts, order = c(0, 1, 1), seasonal = c(0,0,0), xreg = xreg_matrix2, method = "ML", include.mean = TRUE)
+coeftest(arima_controlled)
+summary(arima_controlled)
+
+cf_forecast <- forecast(arima_controlled, xreg = xreg_cf) # counterfactual forecast for visualisation
+
+# Visualisation (models fitted values compared to actual)
+actual <- arima_controlled$x
+fitted <- fitted(arima_controlled)
+time_index <- as.Date(time(actual))
+intervention <- 24
+forecast <- cf_forecast$mean
+forecastupper <- cf_forecast$upper
+forecastlower <- cf_forecast$lower
+
+df_plot <- data.frame(
+  date = time_index,
+  actual = as.numeric(actual),
+  fitted = as.numeric(fitted),
+  counterfactual = as.numeric(forecast),
+  lower = as.numeric(forecastlower),
+  upper = as.numeric(forecastupper)
+)
+df_plot$pre_post <- ifelse(seq_along(actual) < intervention, "Pre", "Post")
+df_plot$residuals <- df_plot$actual - df_plot$fitted
+df_plot$difference <- df_plot$actual - df_plot$counterfactual
+```
+
+## Baseline Characteristics
+
+The two groups are similar across all the metrics. I haven't included p-values in the table as I think visual inspection allows for the similarity to be noted, but can add them if needed.
+
+```{r Baseline Characteristics, echo = FALSE, warning = FALSE}
+data %>%
+  dplyr::select("delivery_prepost", "age", "high_riskstate", "hivpos", "primigravid") %>%  
+  tbl_summary(
+    by = "delivery_prepost",
+    statistic = list(
+      all_continuous() ~ "{median} ({p25} - {p75})"
+    ),
+    digits = all_continuous() ~ 0,
+    missing = "no",
+    label = list("age" ~ "Age (years)",
+                 "high_riskstate" ~ "High Risk Pregnancy",
+                 "hivpos" ~ "HIV+",
+                 "primigravid" ~ "Primigravid") ) %>%
+    modify_header(
+    stat_1 ~ "**Pre-Intervention** <br> n = {n}",
+    stat_2 ~ "**Post-Intervention** <br> n = {n}"
+  )
+```
+
+```{r distribution, echo = FALSE, warning = FALSE}
+groups <- data %>%
+  group_by(delivery_prepost)
+
+ggplot(data, aes(x = us_days, fill = as.factor(delivery_prepost))) +
+  geom_density(alpha = 0.6, adjust = 1.5) +
+  labs(title = "Distribution of Ultrasound Timings",
+       x = "Gestational Age (days)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+## ARIMA summary
+
+For the ARIMA analysis, the data were aggregated by month into the mean days of gestation at each scan. While on visual inspection (fig 1) there appears to be both a step-change and a slope change at the time of the intervention, the pre-intervention data shows a wide range of ultrasound timings which results in large standard errors in the counterfactual prediction (fig 2). While the coefficients within the model are negative (towards earlier scans), they are not statistically significant.
+
+### Figure 1 (counterfactual)
+
+```{r plot 1}
+#| echo: false
+
+ggplot(df_plot, aes(x = date)) +
+  geom_point(aes(y = actual), color = "black", size = 1) +
+  geom_line(aes(y = actual), color = "lightblue", linetype = "solid", linewidth = 1) +
+  geom_line(aes(y = counterfactual), color = "red", linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = time_index[intervention], linetype = "dashed") +
+  labs(title = "Observed vs. Counterfactual Trend",
+       y = "Ultrasound Timing (Mean by Month)",
+       x = "Date") +
+  theme_minimal()
+```
+
+### Figure 2 (with error bars)
+
+```{r plot 2}
+ggplot(df_plot, aes(x = date)) +
+  geom_point(aes(y = actual), color = "blue", size = 1) +
+  geom_line(aes(y = actual), color = "lightblue", linetype = "solid", linewidth = 1) +
+  geom_line(aes(y = counterfactual), color = "red", linetype = "dashed", linewidth = 1) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), color = "grey80") +
+  geom_vline(xintercept = time_index[intervention], linetype = "dashed") +
+  labs(title = "Observed vs. Counterfactual Trend",
+       y = "Ultrasound Timing (Mean by Month)",
+       x = "Date") +
+  theme_minimal()
+```
+
+### Model Summary Tables
+
+::: {layout-ncol="2"}
+```{r arima table1, echo = FALSE}
+
+tidy_arimabasic <- tidy(coeftest(arima_basic))
+tidy_arimacontrol <- tidy(coeftest(arima_controlled))
+arima_results <- rbind(tidy_arimabasic, tidy_arimacontrol)
+arima_t1 <- datasummary_df(tidy_arimabasic,
+               title = "ARIMA (0, 1, 1) without co-variates",
+               output = "markdown",
+               fmt = 3, 
+               rename = c(
+                 term = "Variable",
+                 estimate = "Estimate",
+                 std.error = "Std. Error",
+                 statistic = "Z-value",
+                 p.value = "p-value",
+                 model = "Model"
+               ),
+               stars = TRUE
+  ) 
+arima_t1
+```
+
+```{r arima table 2, echo = FALSE}
+arima_t2 <- datasummary_df(tidy_arimacontrol,
+               title = "ARIMA (0, 1, 1) with co-variates",
+               output = "markdown",
+               fmt = 3, 
+               rename = c(
+                 term = "Variable",
+                 estimate = "Estimate",
+                 std.error = "Std. Error",
+                 statistic = "Z-value",
+                 p.value = "p-value",
+                 model = "Model"
+               ),
+               stars = TRUE
+  )
+
+arima_t2
+```
+:::
+
+## Generalised Estimating Equation
+
+For the analysis of the proportion of early scans in the pre and post intervention periods, a Generalised Estimating Equation was utilised. Unlike the continuous data, individuals without scans were included in the "late ultrasound" group whereas for the previous analysis they had been excluded. The tables for 2 models are below with and without covariates included in the model. The results are consistent with across both. The graph is the result without covariates and shows a much more easy to understand pattern than the more complex model. It is worth noting (and I am working out how to best present this) that the OR, etc are *proportional* changes so 1.03 is a 3% change per month in the proportion of early scans (eg 60 -\> 63%).
+
+```{r gee analysis, echo = FALSE}
+# Generalised Estimating Equation (GEE)
+gee_model <- geeglm(
+  us_earlyrate ~ pre_post + months_post,
+  data = agg,
+  family = binomial(link = "logit"),
+  weights = n,
+  id = month_index,
+  corstr = "ar1"
+)
+
+tbl_regression(
+  gee_model,
+  exponentiate = TRUE,
+  label = list(
+    pre_post ~ "Step Change at Intervention",
+    months_post ~ "Slope Change Intervention"
+  )
+)
+
+gee_model_covar <- geeglm(
+  us_earlyrate ~ pre_post + months_post + age + hiv + high_risk + primi,
+  data = agg, 
+  family = binomial(link = "logit"),
+  weights = n,
+  id = month_index,
+  corstr = "ar1")
+  
+tbl_regression(
+  gee_model_covar,
+  exponentiate = TRUE,
+  label = list(
+    pre_post ~ "Step Change at Intervention",
+    months_post ~ "Slope Change Intervention"
+  )
+)
+
+```
+
+### Figure 3 (GEE Analysis)
+
+```{r gee visualisation, echo=FALSE}
+cf_data <- agg
+cf_data$pre_post <- 0
+
+
+cf_prediction <- predict(gee_model, newdata = cf_data, type = "response")
+cf_data$months_post <-0
+cf_predict2 <- predict(gee_model, newdata = cf_data, type = "response")
+cf_data$actual <- cf_prediction
+cf_data$predicted <- cf_predict2
+
+cf_data$date <- seq.Date(from = as.Date("2017-01-01"),
+                                by = "month", 
+                                length.out = nrow(cf_data))
+
+ggplot(cf_data, aes(x=date)) +
+  geom_point(aes(y = us_earlyrate), color = "blue", size = 1) +
+  geom_line(aes(y = us_earlyrate), color = "lightblue", linewidth = 0.7) +
+  geom_line(aes(y = predicted), color = "red", linewidth = 0.8, linetype = "dashed") +
+  geom_line(aes(y = actual), color = "blue", linewidth = 0.8) +
+  geom_vline(xintercept = time_index[intervention], linetype = "dashed", color = "grey30") +
+  labs(title = "Proportion of Early Scans per month",
+       x = "Month",
+       y = "Proportion") +
+  scale_x_date(date_breaks = "1 year",
+               date_labels = "%Y") +
+  theme_minimal()
+  
+```
+
+## Secondary Analysis
+
+The secondary analysis will look at effects on booking to ultrasound times, and the overall timing of bookings using similar strategies to the primary analysis. Booking to ultrasound time is continuous data, but the mean was stationary. Thus, a segmented linear regression was chosen as the preferred method of analysis. This analysis showed a significant step change around the time of the intervention, but no significant slope change.
+
+```{r Booking to Ultrasound ARIMA, echo = FALSE}
+bookus_reg <- lm(book_us ~ month_index + pre_post + months_post, data = agg)
+tbl_regression(
+  bookus_reg,
+  label = list(
+    pre_post ~ "Step Change at Intervention",
+    months_post ~ "Slope Change Intervention"
+  )
+)
+book <- agg
+book$pre_post <- 0
+book$months_post<- 0
+bookpred <- predict(bookus_reg, data = book)
+book$predicted <- bookpred
+
+ggplot(book, aes(x = date)) + 
+  geom_line(aes(y = book_us), color = "lightblue") +
+  geom_line(aes(y = predicted), color = "red") +
+  geom_vline(xintercept = time_index[intervention], linetype = "dashed", color = "grey30") +
+  scale_x_date(date_breaks = "1 year",
+               date_labels = "%Y") +
+  labs(title = "Days between Booking and First Antenatal Ultrasound", 
+       x = "Date",
+       y = "Days") +
+  theme_minimal()
+```
+
+The proposal included a pre-post analysis of the primary outcome but this would not be a statistically sound method of analysis. It is included below for completeness.
+
+```{r Pre/Post analysis, echo = FALSE}
+t_result <- t.test(us_gest ~ pre_post, data = agg)
+
+t_test_df <- data.frame(
+  Statistic = round(t_result$statistic, 3),
+  DF = round(t_result$parameter, 2),
+  p_value = format.pval(t_result$p.value, digits = 3),
+  Mean_diff = round(diff(t_result$estimate), 3),
+  CI_lower = round(t_result$conf.int[1], 3),
+  CI_upper = round(t_result$conf.int[2], 3)
+)
+t_test_df %>%
+  gt() %>%
+  tab_header(
+    title = "Comparison of Pre/Post Gestational Age at first Ultrasound"
+  ) 
+
+```
+
+### Uptake of scans overall (GEE analysis)
+
+```{r any scan, echo = FALSE}
+# Generalised Estimating Equation (GEE) of any scan rate 
+any_model <- geeglm(
+  us_any ~ pre_post + months_post, data = agg, 
+  family = binomial(link = "logit"), 
+  weights = n, 
+  id = month_index, 
+  corstr = "ar1" 
+  )
+
+tbl_regression( 
+  any_model, 
+  exponentiate = TRUE, 
+  label = list( 
+    pre_post ~ "Step Change at Intervention", 
+    months_post ~ "Slope Change Intervention" 
+    ) )
+
+any_model_covar <- geeglm( 
+  us_any ~ pre_post + months_post + age + hiv + high_risk + primi, 
+  data = agg, 
+  family = binomial(link = "logit"), 
+  weights = n, 
+  id = month_index, 
+  corstr = "ar1"
+  )
+
+tbl_regression( 
+  any_model_covar, 
+  exponentiate = TRUE, 
+  label = list( 
+    pre_post ~ "Step Change at Intervention", 
+    months_post ~ "Slope Change Intervention" 
+    ) )
+
+```
+
+```{r any visualisation, echo=FALSE}
+cfany_data <- agg
+cfany_data$pre_post <- 0
+
+
+cfany_prediction <- predict(any_model, newdata = cfany_data, type = "response")
+cfany_data$months_post <-0
+cfany_predict2 <- predict(any_model, newdata = cfany_data, type = "response")
+cfany_data$actual <- cfany_prediction
+cfany_data$predicted <- cfany_predict2
+
+cfany_data$date <- seq.Date(from = as.Date("2017-01-01"),
+                                by = "month", 
+                                length.out = nrow(cfany_data))
+
+ggplot(cfany_data, aes(x=date)) +
+  geom_point(aes(y = us_any), color = "blue", size = 1) +
+  geom_line(aes(y = us_any), color = "lightblue", linewidth = 0.7) +
+  geom_line(aes(y = predicted), color = "red", linewidth = 0.8, linetype = "dashed") +
+  geom_line(aes(y = actual), color = "blue", linewidth = 0.8) +
+  geom_vline(xintercept = time_index[intervention], linetype = "dashed", color = "grey30") +
+  labs(title = "Proportion of Scans per month",
+       x = "Month",
+       y = "Proportion") +
+  scale_x_date(date_breaks = "1 year",
+               date_labels = "%Y") +
+  theme_minimal()
+  
+
+
+
+```
+
+## My questions
+
+-   Does this answer the primary question and meet the study objectives?
+
+    **Question**
+
+    *Does offering routine basic antenatal ultrasound at a primary healthcare facility compared to a hospital-based service in the Mbhashe Subdistrict of the Eastern Cape increase the proportion of pregnant women who have antenatal ultrasounds in accordance with the South African NDOH guidelines?*
+
+    **Objectives**
+
+    1.  Assess the effect of offering decentralised basic antenatal ultrasound at a primary healthcare clinic on the proportion of pregnant women who have scans between 18- and 20-weeks of gestation.
+    2.  Assess the effect of offering decentralised basic antenatal ultrasound at a primary healthcare clinic on the proportion of pregnant women who have scans before 24-weeks of gestation.
+    3.  Assess the effect of offering decentralised basic antenatal ultrasound at a primary healthcare clinic on the proportion of pregnant women who have at least one antenatal scan.
+    4.  Assess the effect of offering decentralised basic antenatal ultrasound at a primary healthcare clinic on the timing of booking visits, and the total number of antenatal visits by pregnant women at that clinic.
+
+-   Is the analytical process able to be followed (even if the statistical processes are complex)?
+
+-   While the visualisations need work, are the representations in a format that makes sense?
+
+-   What other ways of visualising the data would be helpful?
+
+-   What more do you want to know?
