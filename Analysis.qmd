@@ -92,6 +92,7 @@ agg <- data %>%
     high_risk = mean(high_riskstate, na.rm = TRUE),
     parity = mean(parity, na.rm = TRUE),
     primi = mean(primigravid, na.rm = TRUE),
+    bookdays = mean(booking_days, na.rm = TRUE),
     book_earlyrate = sum(book_early == "Early", na.rm = TRUE) / n,
     anc_visits = mean(antenatal, na.rm = TRUE),
     anc_4ormore = sum(antenatal > 3) / n,
@@ -485,6 +486,157 @@ ggplot(cfany_data, aes(x=date)) +
 
 ```
 
+### Timing of booking
+Similar to the ARIMA of the timing of scans, there is a trend towards earlier scans but the large standard errors mean that nothing reaches statistical significance when looking at the continuous variable "gestational age at booking". The table below is the result of this ARIMA. I haven't produced a graph.
+```{r Timing of Booking, Echo=FALSE}
+bookingts <- ts(agg$bookdays, start = c(2017,1), frequency = 12)
+bookpre_ts <- bookingts[1:23]
+bookpost_ts <- bookingts[24:42]
+
+arima_book <- Arima(bookingts, order = c(2, 1, 0), seasonal = c(0,0,0), xreg = xreg_matrix, method = "ML", include.mean = TRUE)
+
+tidy_arimabook <- tidy(coeftest(arima_book))
+arima_b1 <- datasummary_df(tidy_arimabook,
+               title = "ARIMA (2, 1, 0) without co-variates",
+               output = "markdown",
+               fmt = 3, 
+               rename = c(
+                 term = "Variable",
+                 estimate = "Estimate",
+                 std.error = "Std. Error",
+                 statistic = "Z-value",
+                 p.value = "p-value",
+                 model = "Model"
+               ),
+               stars = TRUE
+  ) 
+arima_b1
+
+```
+The next process is to analyse this data when dichotomised into early / late. This uses the same GEE technique as in the timing of ultrasounds. This has a similar pattern to the other proportional tests, but with no significant change in the timing of bookings. Of note, older cohorts booked earlier than younger cohorts. Tables and graphs below.
+``` {r gee booking, Echo=FALSE}
+gee_book <- geeglm(book_earlyrate ~ month_index + pre_post + months_post,
+                   family = binomial(link = "logit"),
+                   data = agg,
+                   weight = n,
+                  id = month_index, 
+                  corstr = "ar1"
+                  )
+tbl_regression( 
+  gee_book, 
+  exponentiate = TRUE, 
+  label = list( 
+    pre_post ~ "Step Change at Intervention", 
+    months_post ~ "Slope Change Intervention" 
+    ) )
+```
+
+```{r booking covariates, Echo=FALSE}
+gee_book_covar <- geeglm(
+  book_earlyrate ~ month_index + pre_post + months_post+ age + hiv + high_risk + primi, 
+  data = agg, 
+  family = binomial(link = "logit"), 
+  weights = n, 
+  id = month_index, 
+  corstr = "ar1"
+  )
+tbl_regression( 
+  gee_book_covar, 
+  exponentiate = TRUE, 
+  label = list( 
+    pre_post ~ "Step Change at Intervention", 
+    months_post ~ "Slope Change Intervention" 
+    ) )                   
+```
+``` {r booking graph, Echo=FALSE}
+cfbook_data <- agg
+cfbook_data$pre_post <- 0
+cfbook_prediction <- predict(gee_book, newdata = cfbook_data, type = "response")
+cfbook_data$months_post <-0
+cfbook_predict2 <- predict(gee_book, newdata = cfbook_data, type = "response")
+cfbook_data$actual <- cfbook_prediction
+cfbook_data$predicted <- cfbook_predict2
+
+cfbook_data$date <- seq.Date(from = as.Date("2017-01-01"),
+                                by = "month", 
+                                length.out = nrow(cfbook_data))
+
+ggplot(cfbook_data, aes(x=date)) +
+  geom_point(aes(y = book_earlyrate), color = "blue", size = 1) +
+  geom_line(aes(y = book_earlyrate), color = "lightblue", linewidth = 0.7) +
+  geom_line(aes(y = predicted), color = "red", linewidth = 0.8, linetype = "dashed") +
+  geom_line(aes(y = actual), color = "blue", linewidth = 0.8) +
+  geom_vline(xintercept = time_index[intervention], linetype = "dashed", color = "grey30") +
+  labs(title = "Proportion of Early Booking per Month",
+       x = "Month",
+       y = "Proportion") +
+  scale_x_date(date_breaks = "1 year",
+               date_labels = "%Y") +
+  theme_minimal()
+  
+```
+### Number of antenatal visits
+There are a few ways to do this analysis. One is to look at the mean/median visits per cohort, or the data can be dichotomised at certain threshold (eg 4+ visits, less than 4) and those proportions compared, or it can analysed as ordinal data (# with 1 visit, # with 2 visits, etc). I have started with the dichotomised method as it matches the previous techniques. 
+
+```{r antenatal visits, Echo=FALSE}
+antenatal_model <- geeglm(
+  anc_4ormore ~ pre_post + months_post, data = agg, 
+  family = binomial(link = "logit"), 
+  weights = n, 
+  id = month_index, 
+  corstr = "ar1" 
+  )
+
+tbl_regression( 
+  antenatal_model, 
+  exponentiate = TRUE, 
+  label = list( 
+    pre_post ~ "Step Change at Intervention", 
+    months_post ~ "Slope Change Intervention" 
+    ) )
+
+antenatal_model_covar <- geeglm( 
+  anc_4ormore ~ pre_post + months_post + age + hiv + high_risk + primi, 
+  data = agg, 
+  family = binomial(link = "logit"), 
+  weights = n, 
+  id = month_index, 
+  corstr = "ar1"
+  )
+
+tbl_regression( 
+  antenatal_model_covar, 
+  exponentiate = TRUE, 
+  label = list( 
+    pre_post ~ "Step Change at Intervention", 
+    months_post ~ "Slope Change Intervention" 
+    ) )
+
+```
+``` {r antenatal visits graph, Echo=FALSE}
+data <- data %>%
+  mutate(visits_factor = factor(antenatal, ordered = TRUE))
+
+# Calculate the proportion of each visit category per time period
+heatmap_data <- data %>%
+  group_by(delivery_month, visits_factor) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  group_by(delivery_month) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+# Create the heatmap
+ggplot(heatmap_data, aes(x = delivery_month, y = visits_factor, fill = proportion)) +
+  geom_tile() +
+  scale_fill_viridis_c(name = "Proportion") + 
+  labs(title = "Heatmap of Antenatal Visits Over Time",
+       x = "Time Period",
+       y = "Number of Visits") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+
 ## My questions
 
 -   Does this answer the primary question and meet the study objectives?
@@ -495,10 +647,10 @@ ggplot(cfany_data, aes(x=date)) +
 
     **Objectives**
 
-    1.  Assess the effect of offering decentralised basic antenatal ultrasound at a primary healthcare clinic on the proportion of pregnant women who have scans between 18- and 20-weeks of gestation.
+    1.  Assess the effect of offering decentralised basic antenatal ultrasound at a primary healthcare clinic on the proportion of pregnant women who have scans between 18- and 20-weeks of gestation. (This feels outdated with the new guidelines. #2 seems more accurate)
     2.  Assess the effect of offering decentralised basic antenatal ultrasound at a primary healthcare clinic on the proportion of pregnant women who have scans before 24-weeks of gestation.
     3.  Assess the effect of offering decentralised basic antenatal ultrasound at a primary healthcare clinic on the proportion of pregnant women who have at least one antenatal scan.
-    4.  Assess the effect of offering decentralised basic antenatal ultrasound at a primary healthcare clinic on the timing of booking visits, and the total number of antenatal visits by pregnant women at that clinic.
+    4.  Assess the effect of offering decentralised basic antenatal ultrasound at a primary healthcare clinic on the timing of booking visits, and the total number of antenatal visits by pregnant women at that clinic. (Still need to run this one)
 
 -   Is the analytical process able to be followed (even if the statistical processes are complex)?
 
